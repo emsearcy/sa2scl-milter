@@ -1,23 +1,28 @@
-# $Id: Makefile,v 1.1.1.1 2007/01/11 15:49:52 dhartmei Exp $
+CFLAGS=		-g
+LDFLAGS=	-lmilter -lpthread
 
-PROG=	milter-regex
-SRCS=	milter-regex.c eval.c parse.y
-MAN=	milter-regex.8
+all: milter-regex milter-regex.cat8
 
-CFLAGS+=	-Wall -Wstrict-prototypes -O0 -g
-CFLAGS+=	-I/usr/src/gnu/usr.sbin/sendmail/include -I..
-LDADD+=		-lmilter -lpthread -g
+milter-regex: milter-regex.o eval.o strlcpy.o y.tab.o
+	gcc -o milter-regex milter-regex.o eval.o strlcpy.o y.tab.o $(LDFLAGS)
 
-install:
-	sudo rm -rf /usr/local/libexec/milter-regex
-	sudo cp ./milter-regex /usr/local/libexec/
-	sudo pkill milter-regex || echo not running
-	sleep 5
-	sudo /usr/local/libexec/milter-regex
+milter-regex.o: milter-regex.c eval.h
+	gcc $(CFLAGS) -c milter-regex.c
 
-.include <bsd.prog.mk>
+eval.o: eval.c eval.h
+	gcc $(CFLAGS) -c eval.c
 
-.if defined(WANT_LDAP)
-LDADD+=		-L/usr/local/lib -lldap_r -llber
-.endif
+strlcpy.o: strlcpy.c
+	gcc $(CFLAGS) -c strlcpy.c
+	
+y.tab.o: y.tab.c
+	gcc $(CFLAGS) -c y.tab.c
 
+y.tab.c: parse.y
+	yacc -d parse.y
+
+milter-regex.cat8: milter-regex.8
+	nroff -Tascii -mandoc milter-regex.8 > milter-regex.cat8
+
+clean:
+	rm -f *.core milter-regex y.tab.* *.o *.cat8
