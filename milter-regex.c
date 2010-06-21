@@ -1,6 +1,5 @@
-/* $Id: milter-regex.c,v 1.3 2007/08/03 22:11:48 dhartmei Exp $ */
-
 /*
+ * Copyright (c) 2010 Eric Searcy
  * Copyright (c) 2003-2006 Daniel Hartmeier
  * All rights reserved.
  *
@@ -30,8 +29,6 @@
  *
  */
 
-static const char rcsid[] = "$Id: milter-regex.c,v 1.3 2007/08/03 22:11:48 dhartmei Exp $";
-
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -39,7 +36,6 @@ static const char rcsid[] = "$Id: milter-regex.c,v 1.3 2007/08/03 22:11:48 dhart
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <pthread.h>
 #include <pwd.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -52,296 +48,53 @@ static const char rcsid[] = "$Id: milter-regex.c,v 1.3 2007/08/03 22:11:48 dhart
 #endif
 #include <libmilter/mfapi.h>
 
-#include "eval.h"
-
 extern void	 die(const char *);
-extern int	 parse_ruleset(const char *, struct ruleset **, char *,
-		    size_t);
 
-static const char	*rule_file_name = "/etc/milter-regex.conf";
 static int		 debug = 0;
-static pthread_mutex_t	 mutex;
 
 struct context {
-	struct ruleset	*rs;
-	int		*res;
-	char		 buf[2048];	/* longer body lines are wrapped */
-	unsigned	 pos;		/* write position within buf */
+	int		 sclvalue;
+	char		 header[988];
 	char		 host_name[128];
 	char		 host_addr[64];
-	char		 helo[128];
-	char		 hdr_from[128];
-	char		 hdr_to[128];
-	char		 hdr_subject[128];
-	char		*quarantine;
 };
 
-static sfsistat		 setreply(SMFICTX *, struct context *,
-			    const struct action *);
-static struct ruleset	*get_ruleset(void);
 static sfsistat		 cb_connect(SMFICTX *, char *, _SOCK_ADDR *);
-static sfsistat		 cb_helo(SMFICTX *, char *);
-static sfsistat		 cb_envfrom(SMFICTX *, char **);
 static sfsistat		 cb_envrcpt(SMFICTX *, char **);
 static sfsistat		 cb_header(SMFICTX *, char *, char *);
 static sfsistat		 cb_eoh(SMFICTX *);
-static sfsistat		 cb_body(SMFICTX *, u_char *, size_t);
 static sfsistat		 cb_eom(SMFICTX *);
 static sfsistat		 cb_close(SMFICTX *);
 static void		 usage(const char *);
 static void		 msg(int, struct context *, const char *, ...);
 
-#define USER		"_milter-regex"
-#define OCONN		"unix:/var/spool/milter-regex/sock"
-#define RCODE_REJECT	"554"
-#define RCODE_TEMPFAIL	"451"
-#define XCODE_REJECT	"5.7.1"
-#define XCODE_TEMPFAIL	"4.7.1"
-#define	MAXRS		16
+#define USER		"_sclmilt"
+#define OCONN		"unix:/var/spool/sa2scl-milter/sock"
 
-/* Define what sendmail macros should be queried in what context (phase)
- * with smfi_getsymval(). Whether sendmail actually provides specific
- * values depends on configuration of confMILTER_MACROS_*
- */
-struct {
-	const char *phase;
-	const char *name;
-} macro[] = {
-	{ "connect", "{daemon_name}" },
-	{ "connect", "{if_name}" },
-	{ "connect", "{if_addr}" },
-	{ "connect", "j" },
-	{ "connect", "_" },
-	{ "helo", "{tls_version}" },
-	{ "helo", "{cipher}" },
-	{ "helo", "{cipher_bits}" },
-	{ "helo", "{cert_subject}" },
-	{ "helo", "{cert_issuer}" },
-	{ "envfrom", "i" },
-	{ "envfrom", "{auth_type}" },
-	{ "envfrom", "{auth_authen}" },
-	{ "envfrom", "{auth_ssf}" },
-	{ "envfrom", "{auth_author}" },
-	{ "envfrom", "{mail_mailer}" },
-	{ "envfrom", "{mail_host}" },
-	{ "envfrom", "{mail_addr}" },
-	{ "envrcpt", "{rcpt_mailer}" },
-	{ "envrcpt", "{rcpt_host}" },
-	{ "envrcpt", "{rcpt_addr}" },
-	{ NULL, NULL }
-};
-
-#if __linux__ || __sun__
+#if __linux__
 #define	ST_MTIME st_mtime
 extern size_t	 strlcpy(char *, const char *, size_t);
 #else
 #define	ST_MTIME st_mtimespec
 #endif
 
-static void
-mutex_lock(void)
-{
-	if (pthread_mutex_lock(&mutex))
-		die("pthread_mutex_lock");
-}
-
-static void
-mutex_unlock(void)
-{
-	if (pthread_mutex_unlock(&mutex))
-		die("pthread_mutex_unlock");
-}
-
-#ifdef __sun__
-int
-daemon(int nochdir, int noclose)
-{
-	pid_t pid;
-	int fd;
-
-	if ((pid = fork()) < 0) {
-		fprintf(stderr, "fork: %s\n", strerror(errno));
-		return (1);
-	} else if (pid > 0)
-		_exit(0);
-	if ((pid = setsid()) == -1) {
-		fprintf(stderr, "setsid: %s\n", strerror(errno));
-		return (1);
-	}
-	if ((pid = fork()) < 0) {
-		fprintf(stderr, "fork: %s\n", strerror(errno));
-		return (1);
-	} else if (pid > 0)
-		_exit(0);
-	if (!nochdir && chdir("/")) {
-		fprintf(stderr, "chdir: %s\n", strerror(errno));
-		return (1);
-	}
-	if (!noclose) {
-		dup2(fd, fileno(stdout));
-		dup2(fd, fileno(stderr));
-		dup2(open("/dev/null", O_RDONLY, 0), fileno(stdin));
-	}
-	return (0);
-}
-#endif
-
-static sfsistat
-setreply(SMFICTX *ctx, struct context *context, const struct action *action)
-{
-	int result = SMFIS_CONTINUE;
-
-	switch (action->type) {
-	case ACTION_REJECT:
-		msg(LOG_NOTICE, context, "REJECT: %s, Helo: %s, From: %s, "
-		    "To: %s, Subject: %s", action->msg, context->helo,
-		    context->hdr_from, context->hdr_to, context->hdr_subject);
-		result = SMFIS_REJECT;
-		break;
-	case ACTION_TEMPFAIL:
-		msg(LOG_NOTICE, context, "TEMPFAIL: %s, Helo: %s, From: %s, "
-		    "To: %s, Subject: %s", action->msg, context->helo,
-		    context->hdr_from, context->hdr_to, context->hdr_subject);
-		result = SMFIS_TEMPFAIL;
-		break;
-	case ACTION_QUARANTINE:
-		if (context->quarantine != NULL)
-			free(context->quarantine);
-		context->quarantine = strdup(action->msg);
-		break;
-	case ACTION_DISCARD:
-		msg(LOG_NOTICE, context, "DISCARD, Helo: %s, From: %s, "
-		    "To: %s, Subject: %s", context->helo, context->hdr_from,
-		    context->hdr_to, context->hdr_subject);
-		result = SMFIS_DISCARD;
-		break;
-	case ACTION_ACCEPT:
-		msg(LOG_INFO, context, "ACCEPT, Helo: %s, From: %s, "
-		    "To: %s, Subject: %s", context->helo, context->hdr_from,
-		    context->hdr_to, context->hdr_subject);
-		result = SMFIS_ACCEPT;
-		break;
-	}
-	if (action->type == ACTION_REJECT &&
-	    smfi_setreply(ctx, RCODE_REJECT, XCODE_REJECT,
-	    (char *)action->msg) != MI_SUCCESS)
-		msg(LOG_ERR, context, "smfi_setreply");
-	if (action->type == ACTION_TEMPFAIL &&
-	    smfi_setreply(ctx, RCODE_TEMPFAIL, XCODE_TEMPFAIL,
-	    (char *)action->msg) != MI_SUCCESS)
-		msg(LOG_ERR, context, "smfi_setreply");
-	return (result);
-}
-
-static struct ruleset *
-get_ruleset(void)
-{
-	static struct ruleset *rs[MAXRS] = {};
-	static int cur = 0;
-	static time_t last_check = 0;
-	static struct stat sbo;
-	time_t t = time(NULL);
-	int load = 0;
-
-	mutex_lock();
-	if (!last_check)
-		memset(&sbo, 0, sizeof(sbo));
-	if (t - last_check >= 10) {
-		struct stat sb;
-
-		last_check = t;
-		memset(&sb, 0, sizeof(sb));
-		if (stat(rule_file_name, &sb))
-			msg(LOG_ERR, NULL, "get_ruleset: stat: %s: %s",
-			    rule_file_name, strerror(errno));
-		else if (memcmp(&sb.ST_MTIME, &sbo.ST_MTIME,
-		    sizeof(sb.ST_MTIME))) {
-			memcpy(&sbo.ST_MTIME, &sb.ST_MTIME,
-			    sizeof(sb.ST_MTIME));
-			load = 1;
-		}
-	}
-	if (load || rs[cur] == NULL) {
-		int i;
-		char err[8192];
-
-		msg(LOG_DEBUG, NULL, "loading new configuration file");
-		for (i = 0; i < MAXRS; ++i)
-			if (rs[i] != NULL && rs[i]->refcnt == 0) {
-				msg(LOG_DEBUG, NULL, "freeing unused ruleset "
-				    "%d/%d", i, MAXRS);
-				free_ruleset(rs[i]);
-				rs[i] = NULL;
-			}
-		for (i = 0; i < MAXRS; ++i)
-			if (rs[i] == NULL)
-				break;
-		if (i == MAXRS)
-			msg(LOG_ERR, NULL, "all rulesets are in use, cannot "
-			    "load new one", MAXRS);
-		else if (parse_ruleset(rule_file_name, &rs[i], err,
-		    sizeof(err)) || rs[i] == NULL)
-			msg(LOG_ERR, NULL, "parse_ruleset: %s", err);
-		else {
-			msg(LOG_INFO, NULL, "configuration file %s loaded "
-			    "successfully", rule_file_name);
-			cur = i;
-		}
-	}
-	mutex_unlock();
-	return (rs[cur]);
-}
-
-static struct action *
-check_macros(SMFICTX *ctx, struct context *context, const char *phase)
-{
-	struct action *action;
-	int i;
-	const char *v;
-
-	for (i = 0; macro[i].phase != NULL; ++i) {
-		if (strcmp(macro[i].phase, phase))
-			continue;
-		if ((v = smfi_getsymval(ctx, (char *)macro[i].name)) == NULL)
-			v = "";
-		msg(LOG_DEBUG, context, "macro %s = %s", macro[i].name, v);
-		if ((action = eval_cond(context->rs, context->res, COND_MACRO,
-		    macro[i].name, v)) != NULL)
-			return (action);
-	}
-	return (NULL);
-}
-
 static sfsistat
 cb_connect(SMFICTX *ctx, char *name, _SOCK_ADDR *sa)
 {
 	struct context *context;
-	struct action *action;
 
 	context = calloc(1, sizeof(*context));
 	if (context == NULL) {
 		msg(LOG_ERR, NULL, "cb_connect: calloc: %s", strerror(errno));
 		return (SMFIS_ACCEPT);
 	}
-	context->rs = get_ruleset();
-	if (context->rs == NULL) {
-		free(context);
-		msg(LOG_ERR, NULL, "cb_connect: get_ruleset");
-		return (SMFIS_ACCEPT);
-	}
-	context->res = calloc(context->rs->maxidx, sizeof(*context->res));
-	if (context->res == NULL) {
-		free(context);
-		msg(LOG_ERR, NULL, "cb_connect: calloc: %s", strerror(errno));
-		return (SMFIS_ACCEPT);
-	}
 	if (smfi_setpriv(ctx, context) != MI_SUCCESS) {
-		free(context->res);
 		free(context);
 		msg(LOG_ERR, NULL, "cb_connect: smfi_setpriv");
 		return (SMFIS_ACCEPT);
 	}
-	context->rs->refcnt++;
+	context->sclvalue = -1;
+	context->header[0] = '\0';
 
 	strlcpy(context->host_name, name, sizeof(context->host_name));
 	strlcpy(context->host_addr, "unknown", sizeof(context->host_addr));
@@ -371,71 +124,6 @@ cb_connect(SMFICTX *ctx, char *name, _SOCK_ADDR *sa)
 	}
 	msg(LOG_DEBUG, context, "cb_connect('%s', '%s')",
 	    context->host_name, context->host_addr);
-	if ((action = check_macros(ctx, context, "connect")) != NULL) {
-		/* can't really do this, delay */
-		/*return (setreply(ctx, context, action)); */
-	}
-	return (SMFIS_CONTINUE);
-}
-
-static sfsistat
-cb_helo(SMFICTX *ctx, char *arg)
-{
-	struct context *context;
-	const struct action *action;
-
-	if ((context = (struct context *)smfi_getpriv(ctx)) == NULL) {
-		msg(LOG_ERR, NULL, "cb_helo: smfi_getpriv");
-		return (SMFIS_ACCEPT);
-	}
-	strlcpy(context->helo, arg, sizeof(context->helo));
-	msg(LOG_DEBUG, context, "cb_helo('%s')", arg);
-	/* multiple HELO imply RSET in sendmail */
-	/* evaluate connect arguments here, because we can't call */
-	/* setreply from cb_connect */
-	eval_clear(context->rs, context->res, COND_CONNECT);
-	if ((action = eval_cond(context->rs, context->res, COND_CONNECT,
-	    context->host_name, context->host_addr)) != NULL)
-		return (setreply(ctx, context, action));
-	if ((action = eval_end(context->rs, context->res, COND_CONNECT,
-	    COND_MACRO)) !=
-	    NULL)
-		return (setreply(ctx, context, action));
-	if ((action = check_macros(ctx, context, "helo")) != NULL)
-		return (setreply(ctx, context, action));
-	eval_clear(context->rs, context->res, COND_HELO);
-	if ((action = eval_cond(context->rs, context->res, COND_HELO,
-	    arg, NULL)) != NULL)
-		return (setreply(ctx, context, action));
-	if ((action = eval_end(context->rs, context->res, COND_HELO,
-	    COND_MACRO)) != NULL)
-		return (setreply(ctx, context, action));
-	return (SMFIS_CONTINUE);
-}
-
-static sfsistat
-cb_envfrom(SMFICTX *ctx, char **args)
-{
-	struct context *context;
-	const struct action *action;
-
-	if ((context = (struct context *)smfi_getpriv(ctx)) == NULL) {
-		msg(LOG_ERR, NULL, "cb_envfrom: smfi_getpriv");
-		return (SMFIS_ACCEPT);
-	}
-	/* multiple MAIL FROM indicate separate messages */
-	eval_clear(context->rs, context->res, COND_ENVFROM);
-	if (*args != NULL) {
-		msg(LOG_DEBUG, context, "cb_envfrom('%s')", *args);
-		if ((action = eval_cond(context->rs, context->res, COND_ENVFROM,
-		    *args, NULL)) != NULL)
-			return (setreply(ctx, context, action));
-	}
-	if ((action = eval_end(context->rs, context->res, COND_ENVFROM,
-	    COND_MACRO)) != NULL)
-		return (setreply(ctx, context, action));
-	if ((action = check_macros(ctx, context, "envfrom")) != NULL)
-		return (setreply(ctx, context, action));
 	return (SMFIS_CONTINUE);
 }
 
@@ -443,25 +131,19 @@ static sfsistat
 cb_envrcpt(SMFICTX *ctx, char **args)
 {
 	struct context *context;
-	const struct action *action;
 
 	if ((context = (struct context *)smfi_getpriv(ctx)) == NULL) {
 		msg(LOG_ERR, NULL, "cb_envrcpt: smfi_getpriv");
 		return (SMFIS_ACCEPT);
 	}
-	/* multiple RCPT TO: possible */
-	eval_clear(context->rs, context->res, COND_ENVRCPT);
 	if (*args != NULL) {
 		msg(LOG_DEBUG, context, "cb_envrcpt('%s')", *args);
-		if ((action = eval_cond(context->rs, context->res, COND_ENVRCPT,
-		    *args, NULL)) != NULL)
-			return (setreply(ctx, context, action));
+		if (!strcasecmp(args[0], "abuse@insightsnow.com")) {
+			context->scl = 0;
+			strncpy(context->header, "Whitelisted address ", 21);
+			strncat(context->header, args[0], 997 - strlen(context->header));
+		}
 	}
-	if ((action = eval_end(context->rs, context->res, COND_ENVRCPT,
-	    COND_MACRO)) != NULL)
-		return (setreply(ctx, context, action));
-	if ((action = check_macros(ctx, context, "envrcpt")) != NULL)
-		return (setreply(ctx, context, action));
 	return (SMFIS_CONTINUE);
 }
 
@@ -470,25 +152,58 @@ cb_header(SMFICTX *ctx, char *name, char *value)
 {
 	struct context *context;
 	const struct action *action;
+	int salevel;
 
 	if ((context = (struct context *)smfi_getpriv(ctx)) == NULL) {
 		msg(LOG_ERR, context, "cb_header: smfi_getpriv");
 		return (SMFIS_ACCEPT);
 	}
 	msg(LOG_DEBUG, context, "cb_header('%s', '%s')", name, value);
-	if ((action = eval_end(context->rs, context->res, COND_MACRO,
-	    COND_HEADER)) != NULL)
-		return (setreply(ctx, context, action));
-	if (!strcasecmp(name, "From"))
-		strlcpy(context->hdr_from, value, sizeof(context->hdr_from));
-	else if (!strcasecmp(name, "To"))
-		strlcpy(context->hdr_to, value, sizeof(context->hdr_to));
-	else if (!strcasecmp(name, "Subject"))
-		strlcpy(context->hdr_subject, value,
-		    sizeof(context->hdr_subject));
-	if ((action = eval_cond(context->rs, context->res, COND_HEADER,
-	    name, value)) != NULL)
-		return (setreply(ctx, context, action));
+
+	if (context->sclvalue != -1) return (SMFIS_CONTINUE);
+
+	if (!strcasecmp(name, "X-Spam-Level")) {
+		salevel = strlen(value);
+
+		switch (salevel) {
+		case 0:
+		case 1:
+			context->sclvalue = 1;
+			break;
+		case 2:
+			context->sclvalue = 2;
+			break;
+		case 3:
+			context->sclvalue = 3;
+			break;
+		case 4:
+			context->sclvalue = 4;
+			break;
+		case 4:
+			context->sclvalue = 5;
+			break;
+		case 5:
+		case 6:
+			context->sclvalue = 6;
+			break;
+		case 7:
+		case 8:
+			context->sclvalue = 7;
+			break;
+		case 9:
+		case 10:
+			context->sclvalue = 8;
+			break;
+		default:
+			if (salevel > 10) {
+				context->sclvalue = 9;
+			} else {
+				msg(LOG_ERR, NULL, "cb_header: X-Spam-Level parsed %d",
+					salevel);
+			}
+			break;
+		}
+
 	return (SMFIS_CONTINUE);
 }
 
@@ -496,49 +211,18 @@ static sfsistat
 cb_eoh(SMFICTX *ctx)
 {
 	struct context *context;
-	const struct action *action;
 
 	if ((context = (struct context *)smfi_getpriv(ctx)) == NULL) {
 		msg(LOG_ERR, NULL, "cb_eoh: smfi_getpriv");
 		return (SMFIS_ACCEPT);
 	}
 	msg(LOG_DEBUG, context, "cb_eoh()");
-	memset(context->buf, 0, sizeof(context->buf));
-	context->pos = 0;
-	if ((action = eval_end(context->rs, context->res, COND_HEADER,
-	    COND_BODY)) != NULL)
-		return (setreply(ctx, context, action));
-	return (SMFIS_CONTINUE);
-}
 
-static sfsistat
-cb_body(SMFICTX *ctx, u_char *chunk, size_t size)
-{
-	struct context *context;
-
-	if ((context = (struct context *)smfi_getpriv(ctx)) == NULL) {
-		msg(LOG_ERR, NULL, "cb_body: smfi_getpriv");
-		return (SMFIS_ACCEPT);
+	if (context->sclvalue == -1) {
+		context->sclvalue = 0;
+		strncpy(context->header, "Detected source as internal, passing", 37);
 	}
-	for (; size > 0; size--, chunk++) {
-		context->buf[context->pos] = *chunk;
-		if (context->buf[context->pos] == '\n' ||
-		    context->pos == sizeof(context->buf) - 1) {
-			const struct action *action;
 
-			if (context->pos > 0 &&
-			    context->buf[context->pos - 1] == '\r')
-				context->buf[context->pos - 1] = 0;
-			else
-				context->buf[context->pos] = 0;
-			context->pos = 0;
-			msg(LOG_DEBUG, context, "cb_body('%s')", context->buf);
-			if ((action = eval_cond(context->rs, context->res,
-			    COND_BODY, context->buf, NULL)) != NULL)
-				return (setreply(ctx, context, action));
-		} else
-			context->pos++;
-	}
 	return (SMFIS_CONTINUE);
 }
 
@@ -546,29 +230,27 @@ static sfsistat
 cb_eom(SMFICTX *ctx)
 {
 	struct context *context;
-	const struct action *action;
-	int result = SMFIS_ACCEPT;
+	char sclstr[16];
 
 	if ((context = (struct context *)smfi_getpriv(ctx)) == NULL) {
 		msg(LOG_ERR, NULL, "cb_eom: smfi_getpriv");
 		return (SMFIS_ACCEPT);
 	}
 	msg(LOG_DEBUG, context, "cb_eom()");
-	if ((action = eval_end(context->rs, context->res, COND_BODY,
-	    COND_MAX)) != NULL)
-		result = setreply(ctx, context, action);
-	else
-		msg(LOG_DEBUG, context, "ACCEPT, Helo: %s, From: %s, To: %s, "
-		    "Subject: %s", context->helo, context->hdr_from,
-		    context->hdr_to, context->hdr_subject);
-	if (context->quarantine != NULL) {
-		msg(LOG_NOTICE, context, "QUARANTINE: %s, Helo: %s, From: %s, "
-		    "To: %s, Subject: %s", action->msg, context->helo,
-		    context->hdr_from, context->hdr_to, context->hdr_subject);
-		if (smfi_quarantine(ctx, context->quarantine) != MI_SUCCESS)
-			msg(LOG_ERR, context, "cb_eom: smfi_quarantine");
+
+	if (strlen(context->header, "") == 0) {
+		strncpy(context->header, "Processed by SpamAssassin to SCL milter");
 	}
-	return (result);
+
+	if (smfi_addheader(ctx, "X-SA2SCL", context->header) != MI_SUCCESS)
+			msg(LOG_ERR, context, "cb_eom: smfi_addheader (comment)");
+
+	if (context->sclvalue != -1) {
+		snprintf(sclstr, "%d", 16, context->sclvalue);
+		if (smfi_addheader(ctx, "X-MS-Exchange-Organization-SCL", sclstr) != MI_SUCCESS)
+				msg(LOG_ERR, context, "cb_eom: smfi_addheader (SCL)");
+	}
+	return (SMFIS_ACCEPT);
 }
 
 static sfsistat
@@ -580,29 +262,25 @@ cb_close(SMFICTX *ctx)
 	msg(LOG_DEBUG, context, "cb_close()");
 	if (context != NULL) {
 		smfi_setpriv(ctx, NULL);
-		free(context->res);
-		if (context->quarantine != NULL)
-			free(context->quarantine);
-		context->rs->refcnt--;
 		free(context);
 	}
 	return (SMFIS_CONTINUE);
 }
 
 struct smfiDesc smfilter = {
-	"milter-regex",	/* filter name */
-	SMFI_VERSION,	/* version code -- do not change */
-	SMFIF_QUARANTINE, /* flags */
-	cb_connect,	/* connection info filter */
-	cb_helo,	/* SMTP HELO command filter */
-	cb_envfrom,	/* envelope sender filter */
-	cb_envrcpt,	/* envelope recipient filter */
-	cb_header,	/* header filter */
-	cb_eoh,		/* end of header */
-	cb_body,	/* body block */
-	cb_eom,		/* end of message */
-	NULL,		/* message aborted */
-	cb_close	/* connection cleanup */
+	"sa2scl-milter",	/* filter name */
+	SMFI_VERSION,		/* version code -- do not change */
+	SMFIF_ADDHDRS,		/* flags */
+	NULL,			/* connection info filter */
+	NULL,			/* SMTP HELO command filter */
+	NULL,			/* envelope sender filter */
+	cb_envrcpt,		/* envelope recipient filter */
+	cb_header,		/* header filter */
+	cb_eoh,			/* end of header */
+	NULL,			/* body block */
+	cb_eom,			/* end of message */
+	NULL,			/* message aborted */
+	cb_close		/* connection cleanup */
 };
 
 static void
@@ -627,7 +305,7 @@ msg(int priority, struct context *context, const char *fmt, ...)
 static void
 usage(const char *argv0)
 {
-	fprintf(stderr, "usage: %s [-d] [-c config] [-u user] "
+	fprintf(stderr, "usage: %s [-d] [-u user] "
 	    "[-p pipe]\n", argv0);
 	exit(1);
 }
@@ -652,13 +330,10 @@ main(int argc, char **argv)
 	const char *ofile = NULL;
 
 	tzset();
-	openlog("milter-regex", LOG_PID | LOG_NDELAY, LOG_DAEMON);
+	openlog("sa2scl-milter", LOG_PID | LOG_NDELAY, LOG_DAEMON);
 
-	while ((ch = getopt(argc, argv, "c:dp:u:")) != -1) {
+	while ((ch = getopt(argc, argv, "dp:u:")) != -1) {
 		switch (ch) {
-		case 'c':
-			rule_file_name = optarg;
-			break;
 		case 'd':
 			debug = 1;
 			break;
@@ -700,18 +375,13 @@ main(int argc, char **argv)
 			return (1);
 		}
 		if (
-#if ! ( __linux__ || __sun__ )
+#if ! ( __linux__ )
 		    seteuid(pw->pw_uid) ||
 #endif
 		    setuid(pw->pw_uid)) {
 			fprintf(stderr, "setuid: %s\n", strerror(errno));
 			return (1);
 		}
-	}
-
-	if (pthread_mutex_init(&mutex, 0)) {
-		fprintf(stderr, "pthread_mutex_init\n");
-		goto done;
 	}
 
 	if (smfi_setconn((char *)oconn) != MI_SUCCESS) {
@@ -721,11 +391,6 @@ main(int argc, char **argv)
 
 	if (smfi_register(smfilter) != MI_SUCCESS) {
 		fprintf(stderr, "smfi_register: failed\n");
-		goto done;
-	}
-
-	if (eval_init(ACTION_ACCEPT)) {
-		fprintf(stderr, "eval_init: failed\n");
 		goto done;
 	}
 
@@ -746,3 +411,6 @@ main(int argc, char **argv)
 done:
 	return (r);
 }
+
+/* vim: ai noet sw=8 ts=8
+ */
