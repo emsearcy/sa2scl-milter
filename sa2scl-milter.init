@@ -4,7 +4,7 @@
 # chkconfig: - 50 50
 # description: sa2scl-milter Daemon
 #
-# processname: /usr/local/bin/sa2scl-milter
+# processname: /usr/sbin/sa2scl-milter
 # pidfile: /var/run/sa2scl-milter.pid
 
 # source function library
@@ -14,10 +14,7 @@ BASEDIR="/var/run/sa2scl-milter"
 SOCKET="$BASEDIR/milter-regex.sock"
 USER="sclmilt"
 
-# Enable testing only for users specified in config file
-# OPTIONS="-T $OPTIONS"
-
-# No idea what we could put here... paths like above? ;)
+# local overrides
 if [ -f /etc/sysconfig/sa2scl-milter ]
 then
 	. /etc/sysconfig/sa2scl-milter

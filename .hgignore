@@ -1,4 +1,4 @@
 ^\.cvsignore
 \.o
-milter-regex
-milter-regex\.cat8
+\.tar\.gz
+^sa2scl-milter$
