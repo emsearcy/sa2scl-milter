@@ -1,5 +1,5 @@
 #!/bin/sh
-#  init file for sa2scl-milter-
+# sa2scl-milter
 #
 # chkconfig: - 50 50
 # description: sa2scl-milter Daemon
