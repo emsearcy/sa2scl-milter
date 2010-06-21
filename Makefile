@@ -1,5 +1,5 @@
 CFLAGS=		-g
-LDFLAGS=	-lmilter
+LDFLAGS=	-lmilter -pthread
 
 .PHONY: all
 all: sa2scl-milter

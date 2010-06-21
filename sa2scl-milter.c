@@ -139,7 +139,7 @@ cb_envrcpt(SMFICTX *ctx, char **args)
 	if (*args != NULL) {
 		msg(LOG_DEBUG, context, "cb_envrcpt('%s')", *args);
 		if (!strcasecmp(args[0], "abuse@insightsnow.com")) {
-			context->scl = 0;
+			context->sclvalue = 0;
 			strncpy(context->header, "Whitelisted address ", 21);
 			strncat(context->header, args[0], 997 - strlen(context->header));
 		}
@@ -179,10 +179,9 @@ cb_header(SMFICTX *ctx, char *name, char *value)
 		case 4:
 			context->sclvalue = 4;
 			break;
-		case 4:
+		case 5:
 			context->sclvalue = 5;
 			break;
-		case 5:
 		case 6:
 			context->sclvalue = 6;
 			break;
@@ -203,7 +202,7 @@ cb_header(SMFICTX *ctx, char *name, char *value)
 			}
 			break;
 		}
-
+	}
 	return (SMFIS_CONTINUE);
 }
 
@@ -238,15 +237,15 @@ cb_eom(SMFICTX *ctx)
 	}
 	msg(LOG_DEBUG, context, "cb_eom()");
 
-	if (strlen(context->header, "") == 0) {
-		strncpy(context->header, "Processed by SpamAssassin to SCL milter");
+	if (strlen(context->header) == 0) {
+		strncpy(context->header, "Processed by SpamAssassin to SCL milter", 39);
 	}
 
 	if (smfi_addheader(ctx, "X-SA2SCL", context->header) != MI_SUCCESS)
 			msg(LOG_ERR, context, "cb_eom: smfi_addheader (comment)");
 
 	if (context->sclvalue != -1) {
-		snprintf(sclstr, "%d", 16, context->sclvalue);
+		snprintf(sclstr, 16, "%d", context->sclvalue);
 		if (smfi_addheader(ctx, "X-MS-Exchange-Organization-SCL", sclstr) != MI_SUCCESS)
 				msg(LOG_ERR, context, "cb_eom: smfi_addheader (SCL)");
 	}
@@ -401,7 +400,7 @@ main(int argc, char **argv)
 	}
 	umask(0177);
 
-	msg(LOG_INFO, NULL, "started: %s", rcsid);
+	msg(LOG_INFO, NULL, "smfi_main: started");
 	r = smfi_main();
 	if (r != MI_SUCCESS)
 		msg(LOG_ERR, NULL, "smfi_main: terminating due to error");
