@@ -11,8 +11,9 @@
 . /etc/init.d/functions
 
 BASEDIR="/var/run/sa2scl-milter"
-SOCKET="$BASEDIR/milter-regex.sock"
+SOCKET="$BASEDIR/sclmilt.sock"
 USER="sclmilt"
+EXTRA_FLAGS=""
 
 # local overrides
 if [ -f /etc/sysconfig/sa2scl-milter ]
@@ -30,7 +31,7 @@ start() {
 	else
 		if [ x"$BASEDIR" != x -a x"$BASEDIR" != x/ ]; then
 			if [ ! -d "$BASEDIR" ]; then
-			echo -n "creating '$BASEDIR' ... "
+			echo -n "creating '$BASEDIR'...  "
 			mkdir -p "$BASEDIR"
 			chown "$USER" "$BASEDIR"
 			chgrp "$USER" "$BASEDIR"
@@ -43,10 +44,10 @@ start() {
 			failure
 		else
 			if [ -S "$SOCKET" ]; then
-			echo -n "removing stale socket ... "
+			echo -n "removing stale socket...  "
 				rm -f "$SOCKET"
 			fi
-			daemon $prog -u $USER -p $SOCKET
+			daemon $prog -u $USER -p $SOCKET $EXTRA_FLAGS
 			RETVAL=$?
 			[ $RETVAL -eq 0 ] && touch /var/lock/subsys/sa2scl-milter
 		fi

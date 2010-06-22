@@ -37,6 +37,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pwd.h>
+#include <grp.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,7 +55,6 @@ static int		 debug = 0;
 
 struct context {
 	int		 sclvalue;
-	char		 header[988];
 	char		 host_name[128];
 	char		 host_addr[64];
 };
@@ -94,7 +94,6 @@ cb_connect(SMFICTX *ctx, char *name, _SOCK_ADDR *sa)
 		return (SMFIS_ACCEPT);
 	}
 	context->sclvalue = -1;
-	context->header[0] = '\0';
 
 	strlcpy(context->host_name, name, sizeof(context->host_name));
 	strlcpy(context->host_addr, "unknown", sizeof(context->host_addr));
@@ -140,8 +139,6 @@ cb_envrcpt(SMFICTX *ctx, char **args)
 		msg(LOG_DEBUG, context, "cb_envrcpt('%s')", *args);
 		if (!strcasecmp(args[0], "abuse@insightsnow.com")) {
 			context->sclvalue = 0;
-			strncpy(context->header, "Whitelisted address ", 21);
-			strncat(context->header, args[0], 997 - strlen(context->header));
 		}
 	}
 	return (SMFIS_CONTINUE);
@@ -219,7 +216,6 @@ cb_eoh(SMFICTX *ctx)
 
 	if (context->sclvalue == -1) {
 		context->sclvalue = 0;
-		strncpy(context->header, "Detected source as internal, passing", 37);
 	}
 
 	return (SMFIS_CONTINUE);
@@ -237,17 +233,10 @@ cb_eom(SMFICTX *ctx)
 	}
 	msg(LOG_DEBUG, context, "cb_eom()");
 
-	if (strlen(context->header) == 0) {
-		strncpy(context->header, "Processed by SpamAssassin to SCL milter", 39);
-	}
-
-	if (smfi_addheader(ctx, "X-SA2SCL", context->header) != MI_SUCCESS)
-			msg(LOG_ERR, context, "cb_eom: smfi_addheader (comment)");
-
 	if (context->sclvalue != -1) {
 		snprintf(sclstr, 16, "%d", context->sclvalue);
 		if (smfi_addheader(ctx, "X-MS-Exchange-Organization-SCL", sclstr) != MI_SUCCESS)
-				msg(LOG_ERR, context, "cb_eom: smfi_addheader (SCL)");
+				msg(LOG_ERR, context, "cb_eom: smfi_addheader");
 	}
 	return (SMFIS_ACCEPT);
 }
@@ -270,7 +259,7 @@ struct smfiDesc smfilter = {
 	"sa2scl-milter",	/* filter name */
 	SMFI_VERSION,		/* version code -- do not change */
 	SMFIF_ADDHDRS,		/* flags */
-	NULL,			/* connection info filter */
+	cb_connect,		/* connection info filter */
 	NULL,			/* SMTP HELO command filter */
 	NULL,			/* envelope sender filter */
 	cb_envrcpt,		/* envelope recipient filter */
@@ -323,18 +312,23 @@ int
 main(int argc, char **argv)
 {
 	int ch;
+	mode_t omask;
 	const char *oconn = OCONN;
 	const char *user = USER;
+	const char *group = "";
 	sfsistat r = MI_FAILURE;
 	const char *ofile = NULL;
 
 	tzset();
 	openlog("sa2scl-milter", LOG_PID | LOG_NDELAY, LOG_DAEMON);
 
-	while ((ch = getopt(argc, argv, "dp:u:")) != -1) {
+	while ((ch = getopt(argc, argv, "dg:p:u:")) != -1) {
 		switch (ch) {
 		case 'd':
 			debug = 1;
+			break;
+		case 'g':
+			group = optarg;
 			break;
 		case 'p':
 			oconn = optarg;
@@ -362,16 +356,29 @@ main(int argc, char **argv)
 	/* drop privileges */
 	if (!getuid()) {
 		struct passwd *pw;
+		struct group *gr;
 
 		if ((pw = getpwnam(user)) == NULL) {
 			fprintf(stderr, "getpwnam: %s: %s\n", user,
 			    strerror(errno));
 			return (1);
 		}
-		setgroups(1, &pw->pw_gid);
-		if (setegid(pw->pw_gid) || setgid(pw->pw_gid)) {
-			fprintf(stderr, "setgid: %s\n", strerror(errno));
-			return (1);
+		if (strlen(group) == 0 || (gr = getgrnam(group)) == NULL) {
+			/* use primary group of user */
+			setgroups(1, &pw->pw_gid);
+			if (setegid(pw->pw_gid) || setgid(pw->pw_gid)) {
+				fprintf(stderr, "setgid: %s\n", strerror(errno));
+				return (1);
+			}
+			omask = 0177;
+		} else {
+			/* custom group */
+			setgroups(1, &gr->gr_gid);
+			if (setegid(gr->gr_gid) || setgid(gr->gr_gid)) {
+				fprintf(stderr, "setgid: %s\n", strerror(errno));
+				return (1);
+			}
+			omask = 0117;
 		}
 		if (
 #if ! ( __linux__ )
@@ -398,7 +405,7 @@ main(int argc, char **argv)
 		fprintf(stderr, "daemon: %s\n", strerror(errno));
 		goto done;
 	}
-	umask(0177);
+	umask(omask);
 
 	msg(LOG_INFO, NULL, "smfi_main: started");
 	r = smfi_main();
